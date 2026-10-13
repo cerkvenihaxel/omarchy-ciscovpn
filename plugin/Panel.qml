@@ -30,6 +30,13 @@ Panel {
   property bool configured: false
   property bool sudoRuleOk: true
   property bool menuOpen: false
+  // live resource stats (openconnect)
+  property bool statsRunning: false
+  property int statsRssKb: 0
+  property string statsCpu: "0.0"
+  property string statsUptime: ""
+  property double statsRx: 0
+  property double statsTx: 0
   property string message: ""
   property bool messageIsError: false
 
@@ -107,6 +114,21 @@ Panel {
   function checkSudoRule() {
     if (!sudoRuleProc.running) sudoRuleProc.running = true
   }
+  function refreshStats() {
+    if (!statsProc.running) statsProc.running = true
+  }
+  function fmtBytes(n) {
+    n = Number(n) || 0
+    if (n < 1024) return n + " B"
+    var u = ["KB", "MB", "GB", "TB"]; var i = -1
+    do { n /= 1024; i++ } while (n >= 1024 && i < u.length - 1)
+    return n.toFixed(1) + " " + u[i]
+  }
+  function killPlugin() {
+    root.message = "Stopping the plugin…"
+    root.messageIsError = false
+    killProc.running = true
+  }
 
   Process {
     id: sudoRuleProc
@@ -116,6 +138,34 @@ Panel {
       onStreamFinished: {
         try { root.sudoRuleOk = !!JSON.parse(text).ok } catch (e) { root.sudoRuleOk = false }
       }
+    }
+  }
+
+  Process {
+    id: statsProc
+    command: [root.cli, "stats"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try {
+          var d = JSON.parse(text)
+          root.statsRunning = !!d.running
+          root.statsRssKb = d.rssKb || 0
+          root.statsCpu = String(d.cpu || "0.0")
+          root.statsUptime = String(d.uptime || "")
+          root.statsRx = Number(d.rxBytes || 0)
+          root.statsTx = Number(d.txBytes || 0)
+        } catch (e) {}
+      }
+    }
+  }
+
+  Process {
+    id: killProc
+    command: [root.cli, "kill"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: { root.vpnState = "disconnected"; root.refresh() }
     }
   }
 
@@ -209,7 +259,7 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refresh()
+    onTriggered: { root.refresh(); if (root.connected || root.opened) root.refreshStats() }
   }
 
   Component.onCompleted: { root.loadConfig(); root.refresh(); root.checkSudoRule() }
@@ -316,20 +366,20 @@ Panel {
 
       PanelSeparator { foreground: root.bar.foreground }
 
-      // Open panel
+      // Close / stop the plugin (disconnect + remove the widget from the bar)
       Rectangle {
         width: parent.width
         implicitHeight: Style.space(32)
         radius: Style.cornerRadius
-        color: openMa.containsMouse ? Util.alpha(root.bar.foreground, 0.12) : "transparent"
+        color: killMa.containsMouse ? Util.alpha(Color.urgent, 0.12) : "transparent"
         Row {
           anchors.left: parent.left; anchors.leftMargin: Style.space(12)
           anchors.verticalCenter: parent.verticalCenter; spacing: Style.space(10)
-          Text { text: "󰇗"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
-          Text { text: "Open panel"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+          Text { text: "󰅖"; color: Color.urgent; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+          Text { text: "Close (stop plugin)"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
         }
-        MouseArea { id: openMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
-          onClicked: { root.menuOpen = false; root.open() } }
+        MouseArea { id: killMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+          onClicked: { root.menuOpen = false; root.killPlugin() } }
       }
     }
   }
@@ -494,6 +544,47 @@ Panel {
             }
             Text {
               text: root.iface + (root.ip ? "  " + root.ip : "")
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+
+          // ---- resource usage (openconnect) ----
+          Row {
+            visible: root.connected
+            width: parent.width
+            spacing: Style.space(10)
+            Text {
+              text: "Resources"
+              color: root.bar.foreground
+              opacity: 0.6
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: root.statsRunning
+                ? ((root.statsRssKb / 1024).toFixed(1) + " MB · " + root.statsCpu + "% CPU"
+                   + (root.statsUptime ? " · up " + root.statsUptime : ""))
+                : "—"
+              color: root.bar.foreground
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+          }
+          Row {
+            visible: root.connected
+            width: parent.width
+            spacing: Style.space(10)
+            Text {
+              text: "Data"
+              color: root.bar.foreground
+              opacity: 0.6
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+            Text {
+              text: "↓ " + root.fmtBytes(root.statsRx) + "   ↑ " + root.fmtBytes(root.statsTx)
               color: root.bar.foreground
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.caption

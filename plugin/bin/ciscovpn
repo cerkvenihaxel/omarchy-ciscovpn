@@ -323,12 +323,63 @@ cmd_doctor() {
   tail -n 30 "$LOG_FILE" 2>/dev/null || echo "(none)"
 }
 
+cmd_stats() {
+  read_config
+  # Resource usage of the plugin's only real consumer: openconnect (while up).
+  # The bar widget itself has no process; it just polls `status`. We report
+  # openconnect RSS (KB), CPU%, elapsed time, and the tunnel's RX/TX bytes.
+  local pid rss cpu etime iface rx tx
+  pid=""
+  if [[ -f "$PID_FILE" ]]; then
+    local p; p="$(cat "$PID_FILE" 2>/dev/null)"
+    [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null && pid="$p"
+  fi
+  [[ -z "$pid" ]] && pid="$(pgrep -x openconnect 2>/dev/null | head -1)"
+
+  rss=0; cpu="0.0"; etime=""
+  if [[ -n "$pid" ]] && [[ -r "/proc/$pid/status" ]]; then
+    rss="$(awk '/VmRSS/{print $2}' "/proc/$pid/status" 2>/dev/null || echo 0)"
+    read -r cpu etime < <(ps -o %cpu=,etime= -p "$pid" 2>/dev/null | awk '{print $1, $2}')
+    cpu="${cpu:-0.0}"; etime="${etime:-}"
+  fi
+
+  iface=""; rx=0; tx=0
+  for i in $(ip -o link show 2>/dev/null | awk -F': ' '/tun|vpn|cscotun/{print $2}'); do
+    iface="$i"
+    rx="$(cat "/sys/class/net/$i/statistics/rx_bytes" 2>/dev/null || echo 0)"
+    tx="$(cat "/sys/class/net/$i/statistics/tx_bytes" 2>/dev/null || echo 0)"
+    break
+  done
+
+  printf '{"running":%s,"pid":%s,"rssKb":%s,"cpu":%s,"uptime":%s,"interface":%s,"rxBytes":%s,"txBytes":%s}\n' \
+    "$([[ -n "$pid" ]] && echo true || echo false)" \
+    "$([[ -n "$pid" ]] && echo "$pid" || echo 0)" \
+    "${rss:-0}" \
+    "$(json_escape "${cpu:-0.0}")" \
+    "$(json_escape "${etime:-}")" \
+    "$(json_escape "$iface")" \
+    "${rx:-0}" "${tx:-0}"
+}
+
+cmd_kill() {
+  # "Close/kill the plugin": disconnect the VPN and remove the widget from the
+  # bar so it no longer runs/polls. The plugin files stay installed; re-add with
+  # `omarchy bar put custom.ciscovpn` or the panel.
+  cmd_disconnect >/dev/null 2>&1 || true
+  if command -v omarchy-bar >/dev/null 2>&1; then
+    omarchy-bar remove "$PLUGIN_ID" >/dev/null 2>&1 || true
+  fi
+  echo '{"ok":true,"removed":true}'
+}
+
 case "${1:-status}" in
   status)                 cmd_status ;;
   config)                 cmd_config ;;
   set-server)             shift; cmd_set_server "${1:-}" ;;
   connect)                cmd_connect ;;
   disconnect)             cmd_disconnect ;;
+  stats)                  cmd_stats ;;
+  kill)                   cmd_kill ;;
   doctor)                 cmd_doctor ;;
   sudo-rule-ok)           sudo -n "$ROOT_HELPER" check >/dev/null 2>&1 && echo '{"ok":true}' || echo '{"ok":false}' ;;
   _run-connect)           cmd__run_connect ;;
