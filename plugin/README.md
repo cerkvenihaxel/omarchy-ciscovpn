@@ -20,8 +20,8 @@ bash ~/.config/omarchy/plugins/custom.ciscovpn/install.sh
 The installer (idempotent) will:
 
 1. install `openconnect` if it's missing,
-2. add a tight `sudoers.d` rule so the bar can run *only* this plugin's root
-   helper (openconnect up/down) without a password prompt,
+2. set up the SAML webview dependency (no passwordless `sudoers` rule — each
+   connect/disconnect prompts for your sudo password in a terminal),
 3. symlink the `ciscovpn` CLI into `~/.local/bin` and add the widget to the bar.
 
 It does **not** install the proprietary Cisco client or touch unrelated software.
@@ -61,8 +61,9 @@ ciscovpn doctor        # human-readable diagnostics
   profile**, so the gateway hostname is not embedded anywhere — you supply it in
   the panel.
 - `openconnect` needs root only to configure the tunnel device; that's the sole
-  job of `bin/ciscovpn-root`, whitelisted by the sudoers rule. The SAML browser
-  is always launched as your user.
+  job of `bin/ciscovpn-root`, run via an interactive `sudo` in a terminal each
+  time (no passwordless sudoers rule / no standing root grant). The SAML login
+  always runs as your user.
 - If your gateway needs an auth group / tunnel group, append it to the host as
   `host/group`, or add extra openconnect flags via
   `~/.config/omarchy/ciscovpn/config.json` (`extraArgs`).

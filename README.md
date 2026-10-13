@@ -23,9 +23,10 @@ tunnel.
 ```
 
 `link.sh` symlinks the plugin into `~/.config/omarchy/plugins/custom.ciscovpn`
-and runs its installer (installs `openconnect` if missing, adds a tight
-passwordless `sudoers` rule for the root helper, and puts the widget on the bar).
-It asks for your sudo password once.
+and runs its installer (installs `openconnect` if missing, sets up the SAML
+webview deps, and puts the widget on the bar). It installs **no** passwordless
+`sudoers` rule — each connect/disconnect prompts for your sudo password in a
+terminal (no standing root grant).
 
 Then:
 
@@ -104,7 +105,7 @@ omarchy-ciscovpn/
 └── plugin/            ← the plugin itself (what gets linked into Omarchy)
     ├── manifest.json  ← Omarchy plugin manifest (bar-widget)
     ├── Panel.qml      ← the bar icon + popout UI
-    ├── install.sh     ← per-plugin installer (openconnect, sudoers, bar entry)
+    ├── install.sh     ← per-plugin installer (openconnect, SAML deps, bar entry)
     ├── README.md      ← plugin-local usage notes
     └── bin/
         ├── ciscovpn       ← user-side CLI/backend (status, connect, config, …)
