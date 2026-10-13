@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "custom.ciscovpn",
+  "name": "Cisco VPN",
+  "version": "1.0.0",
+  "author": "cerkvenihaxel",
+  "license": "MIT",
+  "description": "Connect to a Cisco Secure Client (AnyConnect) VPN with SAML single sign-on (CyberArk) using openconnect. Shows a status icon in the bar; click to connect/disconnect and configure the gateway.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Cisco VPN",
+    "description": "Cisco AnyConnect VPN with SAML/CyberArk SSO via openconnect",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status refresh interval (seconds)",
+        "min": 3,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 10
+      }
+    ]
+  }
+}

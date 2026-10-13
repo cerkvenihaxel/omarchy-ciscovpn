@@ -1,0 +1,17 @@
+# The proprietary Cisco Secure Client installer is NOT redistributable and is
+# large (~10 MB). Keep it out of the repo. Download it yourself from Cisco.
+*.sh.bak
+cisco-secure-client-*.sh
+*-webdeploy-k9.sh
+
+# Local runtime/config artifacts (never belong in the repo)
+config.json
+state
+*.pid
+*.log
+*.bak-*
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store

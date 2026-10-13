@@ -1,0 +1,269 @@
+#!/usr/bin/env bash
+# ciscovpn — Cisco AnyConnect/Secure Client VPN control for the Omarchy bar plugin.
+#
+# Uses the open-source `openconnect` client to speak the Cisco Secure Client
+# (AnyConnect) protocol, authenticating through SAML/SSO (CyberArk) with the
+# system browser via openconnect's --external-browser handshake.
+#
+# Commands (all print JSON on stdout unless noted):
+#   status            report connection state (reads pid/state files; no root)
+#   config            print saved config (server, protocol) as JSON
+#   set-server HOST   save the VPN gateway host
+#   connect           start the SSO connect flow in a styled terminal
+#   disconnect        tear down the tunnel (needs root helper)
+#   doctor            human-readable diagnostics (plain text)
+#   _run-connect      INTERNAL: the actual openconnect invocation (runs in the terminal)
+#   _browser URL      INTERNAL: --external-browser target; opens URL as the user
+#
+# Privilege model: openconnect needs root to configure the tun device. A tiny
+# root helper (bin/ciscovpn-root) is whitelisted in sudoers by install.sh so the
+# bar can connect/disconnect without a password prompt. The SAML browser is
+# always launched as the logged-in user.
+
+set -uo pipefail
+
+PLUGIN_ID="custom.ciscovpn"
+PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+SELF="$PLUGIN_DIR/bin/ciscovpn"
+ROOT_HELPER="$PLUGIN_DIR/bin/ciscovpn-root"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/ciscovpn"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/ciscovpn"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+PID_FILE="$STATE_DIR/openconnect.pid"
+STATE_FILE="$STATE_DIR/state"          # one of: disconnected|connecting|connected|error
+LOG_FILE="$STATE_DIR/connect.log"
+SERVER_RUNTIME="$STATE_DIR/server"     # host actually used for the live tunnel
+
+mkdir -p "$STATE_DIR" "$CONFIG_DIR"
+
+# ----------------------------------------------------------------- helpers
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+read_config() {
+  CFG_SERVER=""; CFG_PROTOCOL="anyconnect"; CFG_BROWSER=""; CFG_EXTRA=""
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  eval "$(python3 - "$CONFIG_FILE" <<'PY'
+import json,sys,shlex
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    d={}
+def emit(k,v): print("%s=%s"%(k,shlex.quote(str(v))))
+emit("CFG_SERVER", d.get("server",""))
+emit("CFG_PROTOCOL", d.get("protocol","anyconnect"))
+emit("CFG_BROWSER", d.get("browser",""))
+emit("CFG_EXTRA", d.get("extraArgs",""))
+PY
+)"
+}
+
+write_config() { # key value  (string)
+  python3 - "$CONFIG_FILE" "$1" "$2" <<'PY'
+import json,sys,os
+path,key,val=sys.argv[1],sys.argv[2],sys.argv[3]
+try: d=json.load(open(path))
+except Exception: d={}
+d[key]=val
+os.makedirs(os.path.dirname(path),exist_ok=True)
+json.dump(d,open(path,"w"),indent=2)
+PY
+}
+
+get_state() { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo disconnected; }
+set_state() { echo "$1" > "$STATE_FILE"; }
+
+tun_up() {
+  # A live openconnect holds the pid file and keeps a tun/vpn interface up.
+  local pid
+  [[ -f "$PID_FILE" ]] || return 1
+  pid="$(cat "$PID_FILE" 2>/dev/null)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  return 0
+}
+
+# ----------------------------------------------------------------- commands
+cmd_status() {
+  read_config
+  local state iface ip server
+  if tun_up; then
+    state="connected"
+  else
+    # if the process died but we were connecting, surface the stale state
+    local s; s="$(get_state)"
+    if [[ "$s" == "connecting" ]]; then state="connecting"; else state="disconnected"; fi
+  fi
+  set_state "$state"
+
+  # best-effort interface + ip (tun0/vpn0 are the usual names openconnect uses)
+  iface=""; ip=""
+  for i in $(ip -o link show 2>/dev/null | awk -F': ' '/tun|vpn|cscotun/{print $2}'); do
+    iface="$i"
+    ip="$(ip -o -4 addr show "$i" 2>/dev/null | awk '{print $4}' | head -1)"
+    break
+  done
+  server="$CFG_SERVER"
+  [[ -f "$SERVER_RUNTIME" ]] && server="$(cat "$SERVER_RUNTIME")"
+
+  printf '{"state":%s,"server":%s,"interface":%s,"ip":%s,"configured":%s}\n' \
+    "$(json_escape "$state")" \
+    "$(json_escape "$server")" \
+    "$(json_escape "$iface")" \
+    "$(json_escape "$ip")" \
+    "$([[ -n "$CFG_SERVER" ]] && echo true || echo false)"
+}
+
+cmd_config() {
+  read_config
+  printf '{"server":%s,"protocol":%s,"browser":%s,"extraArgs":%s}\n' \
+    "$(json_escape "$CFG_SERVER")" "$(json_escape "$CFG_PROTOCOL")" \
+    "$(json_escape "$CFG_BROWSER")" "$(json_escape "$CFG_EXTRA")"
+}
+
+cmd_set_server() {
+  local host="${1:-}"
+  # strip scheme/trailing slash if the user pasted a URL
+  host="${host#https://}"; host="${host#http://}"; host="${host%%/*}"
+  [[ -z "$host" ]] && { echo '{"ok":false,"error":"empty host"}'; return 1; }
+  write_config server "$host"
+  printf '{"ok":true,"server":%s}\n' "$(json_escape "$host")"
+}
+
+cmd_connect() {
+  read_config
+  if [[ -z "$CFG_SERVER" ]]; then
+    echo '{"ok":false,"error":"no server configured"}'; return 1
+  fi
+  if tun_up; then echo '{"ok":true,"already":true}'; return 0; fi
+  set_state "connecting"
+  : > "$LOG_FILE"
+  # Run the actual connect inside a styled terminal so the user sees the SSO
+  # progress and the browser can pop up. The terminal stays until disconnect.
+  omarchy-launch-tui --app-id=org.omarchy.ciscovpn-connect \
+    bash -lc "'$SELF' _run-connect" >/dev/null 2>&1 &
+  echo '{"ok":true,"launched":true}'
+}
+
+cmd__run_connect() {
+  read_config
+  local browser="${CFG_BROWSER:-$SELF _browser}"
+  # openconnect's --external-browser takes a single executable; wrap ours.
+  local browser_cmd="$SELF"
+  echo "$CFG_SERVER" > "$SERVER_RUNTIME"
+
+  echo "== Cisco VPN (openconnect) =="
+  echo "Gateway : $CFG_SERVER"
+  echo "Protocol: ${CFG_PROTOCOL:-anyconnect}"
+  echo "Auth    : SAML / SSO via system browser (CyberArk)"
+  echo
+
+  set_state "connecting"
+
+  # openconnect needs root to create the tunnel device. Prefer the passwordless
+  # rule (installed by install.sh); if it isn't there yet, fall back to an
+  # interactive sudo prompt in THIS terminal so the flow still works. Either way
+  # the SSO browser opens once openconnect contacts the gateway.
+  local -a helper_cmd=(
+    "$ROOT_HELPER" connect
+    "$CFG_SERVER"
+    "${CFG_PROTOCOL:-anyconnect}"
+    "$SELF"
+    "$PID_FILE"
+    "$USER"
+    "$CFG_EXTRA"
+  )
+
+  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
+    echo "A browser window will open for single sign-on. Complete it there."
+    echo "Keep this window open while connected; close it or run disconnect to stop."
+    echo
+    sudo -n "${helper_cmd[@]}"
+  else
+    echo "The VPN needs root to create the tunnel (openconnect)."
+    echo "Tip: run the installer once to skip this prompt in the future:"
+    echo "     bash \"$PLUGIN_DIR/install.sh\""
+    echo
+    echo "Enter your sudo password below. A browser window will then open for SSO."
+    echo "Keep this window open while connected; close it or run disconnect to stop."
+    echo
+    sudo "${helper_cmd[@]}"
+  fi
+  local rc=$?
+
+  if [[ $rc -eq 0 ]]; then
+    set_state "connected"
+  else
+    set_state "error"
+    echo
+    echo "openconnect exited with code $rc. See above for details."
+  fi
+  # When openconnect foregrounds, closing it returns here -> disconnected.
+  rm -f "$PID_FILE" "$SERVER_RUNTIME"
+  set_state "disconnected"
+  echo
+  read -rp "Disconnected. Press Enter to close."
+}
+
+cmd__browser() {
+  # Invoked by openconnect as the external browser handler with the SSO URL.
+  # openconnect runs as root; we must open the browser as the real user.
+  local url="${1:-}"
+  [[ -z "$url" ]] && exit 1
+  # If we're root (called from the root helper's openconnect), drop to user.
+  local target_user="${SUDO_USER:-${CISCOVPN_USER:-$USER}}"
+  if [[ "$(id -u)" -eq 0 && -n "$target_user" && "$target_user" != "root" ]]; then
+    local uid; uid="$(id -u "$target_user")"
+    sudo -u "$target_user" \
+      env DISPLAY="${DISPLAY:-:0}" \
+          WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" \
+          XDG_RUNTIME_DIR="/run/user/$uid" \
+      xdg-open "$url" >/dev/null 2>&1 &
+  else
+    xdg-open "$url" >/dev/null 2>&1 &
+  fi
+}
+
+cmd_disconnect() {
+  if ! tun_up && [[ "$(get_state)" == "disconnected" ]]; then
+    echo '{"ok":true,"already":true}'; return 0
+  fi
+  sudo -n "$ROOT_HELPER" disconnect "$PID_FILE" >/dev/null 2>&1
+  rm -f "$PID_FILE" "$SERVER_RUNTIME"
+  set_state "disconnected"
+  echo '{"ok":true}'
+}
+
+cmd_doctor() {
+  read_config
+  echo "Cisco VPN plugin diagnostics"
+  echo "============================"
+  echo "openconnect : $(command -v openconnect || echo 'MISSING — install it')"
+  openconnect --version 2>/dev/null | head -1
+  echo "server      : ${CFG_SERVER:-<not set>}"
+  echo "protocol    : ${CFG_PROTOCOL:-anyconnect}"
+  echo "state       : $(get_state)"
+  echo "root helper : $ROOT_HELPER"
+  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
+    echo "sudo rule   : OK (passwordless root helper works)"
+  else
+    echo "sudo rule   : NOT configured — run install.sh"
+  fi
+  echo "browser     : $(command -v xdg-open || echo 'MISSING')"
+  echo
+  echo "Recent connect log:"
+  echo "-------------------"
+  tail -n 30 "$LOG_FILE" 2>/dev/null || echo "(none)"
+}
+
+case "${1:-status}" in
+  status)        cmd_status ;;
+  config)        cmd_config ;;
+  set-server)    shift; cmd_set_server "${1:-}" ;;
+  connect)       cmd_connect ;;
+  disconnect)    cmd_disconnect ;;
+  doctor)        cmd_doctor ;;
+  _run-connect)  cmd__run_connect ;;
+  _browser)      shift; cmd__browser "${1:-}" ;;
+  *) echo "{\"error\":\"unknown command: $1\"}"; exit 2 ;;
+esac

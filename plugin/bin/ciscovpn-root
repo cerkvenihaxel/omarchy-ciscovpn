@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# ciscovpn-root — the only part that runs as root (via a dedicated sudoers rule).
+#
+# It launches `openconnect` to build the Cisco Secure Client (AnyConnect) tunnel
+# using SAML/SSO through the system browser, and tears it down on request.
+# Kept deliberately small and with a fixed argument shape so the sudoers rule
+# that whitelists it is tight.
+#
+#   ciscovpn-root connect <server> <protocol> <browser-handler> <pidfile> <user> [extra]
+#   ciscovpn-root disconnect <pidfile>
+#   ciscovpn-root check
+#
+# <browser-handler> is the user-side `ciscovpn` script; openconnect calls it as
+#   <browser-handler> _browser <URL>
+# and it opens the URL as <user> for the SAML login.
+
+set -uo pipefail
+
+cmd="${1:-}"
+
+case "$cmd" in
+  check)
+    # Used by `doctor` to confirm the passwordless rule works.
+    command -v openconnect >/dev/null || exit 3
+    exit 0
+    ;;
+
+  connect)
+    server="${2:?server required}"
+    protocol="${3:-anyconnect}"
+    browser_handler="${4:?browser handler required}"
+    pidfile="${5:?pidfile required}"
+    user="${6:?user required}"
+    extra="${7:-}"
+
+    command -v openconnect >/dev/null || { echo "openconnect not installed"; exit 3; }
+
+    mkdir -p "$(dirname "$pidfile")"
+
+    # Export the target user so the browser handler can drop privileges.
+    export CISCOVPN_USER="$user"
+
+    # Build the external-browser command. openconnect appends the SSO URL as a
+    # final argument, so the handler receives:  <handler> _browser <URL>
+    #
+    # openconnect's --external-browser takes ONE executable path. We point it at
+    # a tiny generated shim (written per-connection) that forwards to our
+    # handler with the _browser subcommand.
+    shim="$(mktemp /tmp/ciscovpn-browser.XXXXXX)"
+    cat > "$shim" <<EOF
+#!/usr/bin/env bash
+exec "$browser_handler" _browser "\$@"
+EOF
+    chmod 755 "$shim"
+    # make sure the user can be reached by the handler's sudo -u
+    export SUDO_USER="$user"
+
+    cleanup() { rm -f "$shim"; }
+    trap cleanup EXIT
+
+    echo "Launching openconnect to $server ..."
+    # --protocol         speak the Cisco Secure Client / AnyConnect protocol
+    # --external-browser  do SAML SSO via the system browser (CyberArk IdP)
+    # --pid-file          lets the user side detect a live tunnel
+    # Foreground (no --background) so closing the terminal/openconnect ends it.
+    # shellcheck disable=SC2086
+    exec openconnect \
+      --protocol="$protocol" \
+      --external-browser="$shim" \
+      --pid-file="$pidfile" \
+      $extra \
+      "$server"
+    ;;
+
+  disconnect)
+    pidfile="${2:?pidfile required}"
+    if [[ -f "$pidfile" ]]; then
+      pid="$(cat "$pidfile" 2>/dev/null)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 0.4; done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+      fi
+      rm -f "$pidfile"
+    fi
+    # Also sweep any stray openconnect we own, as a safety net.
+    pkill -f "openconnect .*--pid-file=$pidfile" 2>/dev/null || true
+    exit 0
+    ;;
+
+  *)
+    echo "usage: ciscovpn-root {connect|disconnect|check} ..." >&2
+    exit 2
+    ;;
+esac
