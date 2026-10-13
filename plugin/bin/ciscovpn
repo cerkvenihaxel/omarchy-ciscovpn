@@ -25,16 +25,11 @@ set -uo pipefail
 PLUGIN_ID="custom.ciscovpn"
 PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 SELF="$PLUGIN_DIR/bin/ciscovpn"
-# The privileged helper runs from a ROOT-OWNED location (installed by
-# install.sh). The sudoers rule only whitelists that path, so a tampered copy
-# in the user-writable plugin dir can never be run as root. Fall back to the
-# local copy only when the secure one isn't installed yet (first run, no sudo).
-ROOT_HELPER_SECURE="/usr/local/lib/omarchy-ciscovpn/ciscovpn-root"
-if [[ -x "$ROOT_HELPER_SECURE" ]]; then
-  ROOT_HELPER="$ROOT_HELPER_SECURE"
-else
-  ROOT_HELPER="$PLUGIN_DIR/bin/ciscovpn-root"
-fi
+# The privileged helper always runs through an interactive `sudo` (the user
+# authenticates each connect/disconnect in a terminal). There is no passwordless
+# sudoers rule and no standing root grant, so the helper simply runs from the
+# plugin dir.
+ROOT_HELPER="$PLUGIN_DIR/bin/ciscovpn-root"
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/ciscovpn"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/ciscovpn"
@@ -158,19 +153,12 @@ cmd_connect() {
   if tun_up; then echo '{"ok":true,"already":true}'; return 0; fi
   : > "$LOG_FILE"
 
-  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
-    # Passwordless rule present → fully headless: SSO webview (GUI) + background
-    # openconnect. No terminal window at all. Run detached so the bar returns.
-    set_state "connecting"
-    setsid bash -lc "'$SELF' _run-connect-headless" >>"$LOG_FILE" 2>&1 &
-    echo '{"ok":true,"headless":true}'
-  else
-    # No passwordless rule yet → we need a terminal once for the sudo password.
-    set_state "connecting"
-    omarchy-launch-tui --app-id=org.omarchy.ciscovpn-connect \
-      bash -lc "'$SELF' _run-connect" >/dev/null 2>&1 &
-    echo '{"ok":true,"launched":true,"needsSudoRule":true}'
-  fi
+  # Always run in a terminal: the SSO webview appears, then you authorize the
+  # tunnel with your sudo password right there. No standing passwordless grant.
+  set_state "connecting"
+  omarchy-launch-tui --app-id=org.omarchy.ciscovpn-connect \
+    bash -lc "'$SELF' _run-connect" >/dev/null 2>&1 &
+  echo '{"ok":true,"launched":true}'
 }
 
 # Shared: run the SAML webview as the user and echo "server|cookie|fingerprint".
@@ -187,38 +175,15 @@ print("%s\t%s\t%s" % (d.get("server",""), d.get("cookie",""), d.get("fingerprint
 PY
 }
 
-# Headless connect: no terminal. SSO webview pops up (GUI), tunnel runs in the
-# background. Used when the passwordless sudoers rule is installed.
-cmd__run_connect_headless() {
-  read_config
-  echo "$CFG_SERVER" > "$SERVER_RUNTIME"
-  set_state "connecting"
-
-  local parsed server cookie fingerprint
-  parsed="$(_saml_authenticate)" || { set_state "error"; rm -f "$SERVER_RUNTIME"; set_state "disconnected"; return 1; }
-  IFS=$'\t' read -r server cookie fingerprint <<<"$parsed"
-
-  printf '%s' "$cookie" | sudo -n "$ROOT_HELPER" connect \
-      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint"
-  local rc=$?
-
-  if [[ $rc -eq 0 ]] && tun_up; then
-    set_state "connected"
-  else
-    set_state "error"
-    rm -f "$PID_FILE" "$SERVER_RUNTIME"
-    set_state "disconnected"
-  fi
-}
-
+# Terminal connect: SSO webview (GUI) appears, then you authorize the tunnel
+# with your sudo password in this terminal. openconnect then runs in the
+# background; the window can be closed once connected.
 cmd__run_connect() {
   read_config
   echo "$CFG_SERVER" > "$SERVER_RUNTIME"
 
   echo "== Cisco VPN (openconnect + SAML/CyberArk) =="
   echo "Gateway : $CFG_SERVER"
-  echo
-  echo "This one-time prompt disappears after you enable passwordless connect."
   echo
 
   set_state "connecting"
@@ -232,8 +197,7 @@ cmd__run_connect() {
   }
   IFS=$'\t' read -r server cookie fingerprint <<<"$parsed"
 
-  echo "SSO complete. Bringing up the tunnel (enter your sudo password)…"
-  echo "Tip: run $PLUGIN_DIR/install.sh once to make this fully silent."
+  echo "SSO complete. Enter your sudo password to bring up the VPN tunnel."
   echo
   printf '%s' "$cookie" | sudo "$ROOT_HELPER" connect \
       "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint"
@@ -276,20 +240,15 @@ cmd_disconnect() {
   if ! tun_up && [[ "$(get_state)" == "disconnected" ]]; then
     echo '{"ok":true,"already":true}'; return 0
   fi
-  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
-    sudo -n "$ROOT_HELPER" disconnect "$PID_FILE" "$CFG_SERVER" >/dev/null 2>&1
-  else
-    # No passwordless rule — need a terminal for the sudo password to tear down.
-    omarchy-launch-tui --app-id=org.omarchy.ciscovpn-disconnect \
-      bash -lc "sudo '$ROOT_HELPER' disconnect '$PID_FILE' '$CFG_SERVER'; echo; echo Disconnected.; sleep 1" \
-      >/dev/null 2>&1 &
-    # give the terminal a moment; status polling will reflect the result
-  fi
+  # Tear down in a terminal so you can authorize with your sudo password.
+  omarchy-launch-tui --app-id=org.omarchy.ciscovpn-disconnect \
+    bash -lc "sudo '$ROOT_HELPER' disconnect '$PID_FILE' '$CFG_SERVER'; echo; echo Disconnected.; sleep 1" \
+    >/dev/null 2>&1 &
   rm -f "$PID_FILE" "$SERVER_RUNTIME"
-  # Verify: only report disconnected if the tunnel is actually gone.
-  sleep 1
+  # Verify shortly after; status polling will also catch up.
+  sleep 2
   if tun_up; then
-    echo '{"ok":false,"error":"still connected — authorize the disconnect"}'
+    echo '{"ok":false,"error":"authorize the disconnect in the terminal"}'
   else
     set_state "disconnected"
     echo '{"ok":true}'
@@ -311,11 +270,7 @@ cmd_doctor() {
   fi
   echo "state       : $(get_state)"
   echo "root helper : $ROOT_HELPER"
-  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
-    echo "sudo rule   : OK (passwordless root helper works)"
-  else
-    echo "sudo rule   : NOT configured — run install.sh"
-  fi
+  echo "privilege   : interactive sudo per connect/disconnect (no standing root grant)"
   echo "browser     : $(command -v xdg-open || echo 'MISSING')"
   echo
   echo "Recent connect log:"
@@ -381,9 +336,7 @@ case "${1:-status}" in
   stats)                  cmd_stats ;;
   kill)                   cmd_kill ;;
   doctor)                 cmd_doctor ;;
-  sudo-rule-ok)           sudo -n "$ROOT_HELPER" check >/dev/null 2>&1 && echo '{"ok":true}' || echo '{"ok":false}' ;;
   _run-connect)           cmd__run_connect ;;
-  _run-connect-headless)  cmd__run_connect_headless ;;
   _browser)               shift; cmd__browser "${1:-}" ;;
   *) echo "{\"error\":\"unknown command: $1\"}"; exit 2 ;;
 esac

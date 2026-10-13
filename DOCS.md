@@ -191,29 +191,28 @@ openconnect.
 openconnect needs root **only** to create/configure the tunnel device. Nothing
 else in the plugin runs as root.
 
-- `install.sh` installs `/etc/sudoers.d/omarchy-ciscovpn`:
+**No standing root grant.** This plugin installs **no** passwordless `sudoers`
+rule. Each connect and disconnect runs the privileged helper through an
+**interactive `sudo` in a terminal**, so you authorize the action with your
+password every time. This is a deliberate security choice: a `NOPASSWD` entry
+is a permanent, unattended path to root for your account, and on a security
+workstation that standing exposure is not worth skipping a password prompt.
+`install.sh` actively removes any legacy passwordless rule / root-owned helper
+copy from earlier versions.
 
-  ```
-  <you> ALL=(root) NOPASSWD: /usr/local/lib/omarchy-ciscovpn/ciscovpn-root
-  ```
-
-  The whitelisted helper lives in a **root-owned, root-only-writable**
-  directory (`/usr/local/lib/omarchy-ciscovpn/`), installed there by
-  `install.sh`. The copy inside the user-writable plugin dir is **never** what
-  sudo runs. This closes the obvious local-privilege-escalation hole: a NOPASSWD
-  rule pointing at a user-writable script would let any process running as you
-  rewrite it and gain root. The rule is validated with `visudo -c` before
-  install.
+- **Interactive privilege only.** `ciscovpn connect`/`disconnect` open a terminal
+  (`omarchy-launch-tui`) and call `sudo "$PLUGIN_DIR/bin/ciscovpn-root" …`. You
+  see and approve the privileged step; nothing runs as root unattended.
 
 - **Strict input validation in the root helper.** Every argument from the
-  unprivileged caller is validated before use: `server` against a hostname
-  regex, `protocol` against an allowlist, `pidfile` must live under the caller's
-  own state dir (no path traversal), `fingerprint` against a hex/pin format. A
-  **server certificate pin is required** — the helper refuses to connect
-  without one, so there is no silent cert-validation bypass.
+  caller is validated before use: `server` against a hostname regex, `protocol`
+  against an allowlist, `pidfile` must live under the caller's own state dir (no
+  path traversal), `fingerprint` against a hex/pin format. A **server
+  certificate pin is required** — the helper refuses to connect without one, so
+  there is no silent cert-validation bypass.
 
-- **No caller free-form arguments reach root.** The old `extraArgs` passthrough
-  to the root `openconnect` command was removed; the root command line is a
+- **No caller free-form arguments reach root.** There is no `extraArgs`
+  passthrough to the root `openconnect` command; the root command line is a
   fixed, audited set of flags only.
 
 - **The SAML session cookie never touches disk or argv.** It is read from stdin
@@ -232,7 +231,7 @@ else in the plugin runs as root.
 
 ### Security review checklist
 
-- [x] NOPASSWD sudoers target is root-owned and not user-writable.
+- [x] No passwordless sudoers rule; every privileged action is an interactive `sudo`.
 - [x] All caller inputs to the root helper are validated; injection attempts rejected (tested).
 - [x] No caller-supplied free-form args in the privileged command line.
 - [x] Server certificate pin mandatory; connect refused without it.
@@ -240,11 +239,6 @@ else in the plugin runs as root.
 - [x] State/config dirs are `0700`; stale token-bearing logs scrubbed on install.
 - [x] Teardown verifies process identity before killing.
 - No secrets are stored at rest; authentication is entirely IdP-side (CyberArk).
-
-> Updating the plugin (e.g. `git pull`) changes only the user-dir copy. **Re-run
-> `install.sh`** to refresh the root-owned helper at
-> `/usr/local/lib/omarchy-ciscovpn/`, otherwise the privileged helper stays at
-> the previously installed version.
 
 ---
 

@@ -28,7 +28,6 @@ Panel {
   property string iface: ""
   property string ip: ""
   property bool configured: false
-  property bool sudoRuleOk: true
   property bool menuOpen: false
   // live resource stats (openconnect)
   property bool statsRunning: false
@@ -106,14 +105,6 @@ Panel {
     setServerProc.command = [root.cli, "set-server", host]
     setServerProc.running = true
   }
-  function runInstaller() {
-    Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.ciscovpn-install",
-      "bash", "-lc", "bash '" + Quickshell.env("HOME")
-        + "/.config/omarchy/plugins/custom.ciscovpn/install.sh'; echo; read -rp 'Press Enter to close'"])
-  }
-  function checkSudoRule() {
-    if (!sudoRuleProc.running) sudoRuleProc.running = true
-  }
   function refreshStats() {
     if (!statsProc.running) statsProc.running = true
   }
@@ -128,17 +119,6 @@ Panel {
     root.message = "Stopping the plugin…"
     root.messageIsError = false
     killProc.running = true
-  }
-
-  Process {
-    id: sudoRuleProc
-    command: [root.cli, "sudo-rule-ok"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        try { root.sudoRuleOk = !!JSON.parse(text).ok } catch (e) { root.sudoRuleOk = false }
-      }
-    }
   }
 
   Process {
@@ -262,10 +242,10 @@ Panel {
     onTriggered: { root.refresh(); if (root.connected || root.opened) root.refreshStats() }
   }
 
-  Component.onCompleted: { root.loadConfig(); root.refresh(); root.checkSudoRule() }
+  Component.onCompleted: { root.loadConfig(); root.refresh() }
 
   onOpenedChanged: {
-    if (opened) { root.message = ""; root.loadConfig(); root.refresh(); root.checkSudoRule() }
+    if (opened) { root.message = ""; root.loadConfig(); root.refresh() }
   }
 
   IpcHandler {
@@ -450,42 +430,6 @@ Panel {
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
-          }
-        }
-
-        // Passwordless/no-window hint — only when the sudoers rule is missing.
-        Rectangle {
-          visible: !root.sudoRuleOk
-          width: parent.width
-          implicitHeight: pwlCol.implicitHeight + Style.space(20)
-          radius: Style.cornerRadius
-          color: Util.alpha(Color.urgent, 0.10)
-          border.color: Util.alpha(Color.urgent, 0.45)
-          border.width: 1
-
-          Column {
-            id: pwlCol
-            anchors.left: parent.left
-            anchors.right: parent.right
-            anchors.verticalCenter: parent.verticalCenter
-            anchors.margins: Style.space(12)
-            spacing: Style.space(8)
-
-            Text {
-              width: parent.width
-              text: "Connect opens a terminal for your sudo password. Enable passwordless connect once to make it fully silent (no window, no prompt)."
-              color: Color.urgent
-              font.family: root.bar.fontFamily
-              font.pixelSize: Style.font.caption
-              wrapMode: Text.Wrap
-            }
-            Button {
-              text: "Enable passwordless connect"
-              bordered: true
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
-              onClicked: root.runInstaller()
-            }
           }
         }
 

@@ -67,39 +67,21 @@ else
 fi
 
 # ---------------------------------------------------------------- sudoers rule
-step "Privileged helper (root-owned) + sudoers"
-# SECURITY: the plugin dir is user-writable, so we must NOT let sudo run the
-# helper from there (a tampered copy would be instant root). Install the helper
-# to a root-owned, root-only-writable location and whitelist THAT path.
-SECURE_DIR="/usr/local/lib/omarchy-ciscovpn"
-SECURE_HELPER="$SECURE_DIR/ciscovpn-root"
-sudo install -d -m 0755 -o root -g root "$SECURE_DIR" || fail "could not create $SECURE_DIR"
-sudo install -m 0755 -o root -g root "$ROOT_HELPER" "$SECURE_HELPER" || fail "could not install root helper"
-ok "root helper installed at $SECURE_HELPER (owned by root)"
-
-# Only the exact root-owned helper path, nothing else. visudo-checked.
-TMP_SUDO="$(mktemp)"
-cat > "$TMP_SUDO" <<EOF
-# Installed by the Cisco VPN Omarchy plugin ($PLUGIN_ID).
-# Lets $USER run ONLY the plugin's root-owned VPN helper (openconnect up/down)
-# without a password. The helper validates all inputs and runs no caller-
-# supplied arguments. It is root-owned and not writable by $USER.
-$USER ALL=(root) NOPASSWD: $SECURE_HELPER
-EOF
-if sudo visudo -c -f "$TMP_SUDO" >/dev/null 2>&1; then
-  sudo install -m 0440 -o root -g root "$TMP_SUDO" "$SUDOERS_FILE" || fail "could not install sudoers rule"
-  ok "sudoers rule installed at $SUDOERS_FILE (scoped to the root-owned helper)"
-else
-  rm -f "$TMP_SUDO"
-  fail "sudoers rule failed validation (visudo) — not installed"
+step "Privilege model"
+# By design this plugin installs NO passwordless sudoers rule and NO standing
+# root grant. Each connect/disconnect runs the privileged helper through an
+# interactive `sudo` in a terminal, so you authorize the action with your
+# password every time. If an old passwordless rule from a previous version is
+# present, remove it now.
+if [[ -f /etc/sudoers.d/omarchy-ciscovpn ]]; then
+  sudo rm -f /etc/sudoers.d/omarchy-ciscovpn && ok "removed a legacy passwordless sudoers rule" \
+    || warn "could not remove /etc/sudoers.d/omarchy-ciscovpn (remove it manually)"
 fi
-rm -f "$TMP_SUDO"
-
-if sudo -n "$SECURE_HELPER" check >/dev/null 2>&1; then
-  ok "passwordless root helper works"
-else
-  warn "root helper check did not pass yet — openconnect may be missing or path changed"
+if [[ -d /usr/local/lib/omarchy-ciscovpn ]]; then
+  sudo rm -rf /usr/local/lib/omarchy-ciscovpn && ok "removed a legacy root-owned helper copy" \
+    || warn "could not remove /usr/local/lib/omarchy-ciscovpn (remove it manually)"
 fi
+ok "no standing root grant — connect/disconnect prompt for sudo in a terminal"
 
 # ---------------------------------------------------------------- CLI + bar
 step "CLI and bar widget"
