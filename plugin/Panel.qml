@@ -29,6 +29,7 @@ Panel {
   property string ip: ""
   property bool configured: false
   property bool sudoRuleOk: true
+  property bool menuOpen: false
   property string message: ""
   property bool messageIsError: false
 
@@ -67,10 +68,10 @@ Panel {
 
   readonly property string tooltip: {
     if (!configured) return "Cisco VPN — no gateway set"
-    if (connected) return "Cisco VPN — connected" + (server ? " (" + server + ")" : "") + (ip ? " · " + ip : "")
-    if (connecting) return "Cisco VPN — connecting to " + server + "…"
+    if (connected) return "Cisco VPN — connected" + (server ? " (" + server + ")" : "") + (ip ? " · " + ip : "") + "\nRight-click to disconnect"
+    if (connecting) return "Cisco VPN — connecting to " + server + "…\nRight-click to cancel"
     if (vpnState === "error") return "Cisco VPN — connection error"
-    return "Cisco VPN — disconnected (" + server + ")"
+    return "Cisco VPN — disconnected (" + server + ")\nRight-click to connect"
   }
 
   // ---- backend calls ----
@@ -97,10 +98,6 @@ Panel {
     if (host === "") { root.message = "Gateway is empty"; root.messageIsError = true; return }
     setServerProc.command = [root.cli, "set-server", host]
     setServerProc.running = true
-  }
-  function runDoctor() {
-    Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.ciscovpn-doctor",
-      "bash", "-lc", root.cli + " doctor | less -R"])
   }
   function runInstaller() {
     Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.ciscovpn-install",
@@ -179,7 +176,14 @@ Panel {
     command: [root.cli, "disconnect"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: { root.message = "Disconnected"; root.messageIsError = false; root.refresh() }
+      onStreamFinished: {
+        try {
+          var d = JSON.parse(text)
+          if (d.ok === false) { root.message = d.error || "Disconnect failed"; root.messageIsError = true }
+          else { root.message = "Disconnected"; root.messageIsError = false }
+        } catch (e) { root.message = "Disconnected"; root.messageIsError = false }
+        root.refresh()
+      }
     }
     stderr: StdioCollector { waitForEnd: true }
   }
@@ -249,11 +253,92 @@ Panel {
     }
     onPressed: function(b) {
       if (b === Qt.RightButton) {
-        // right-click: quick toggle connect/disconnect
-        if (root.connected || root.connecting) root.disconnectVpn()
-        else root.connectVpn()
+        // right-click: show a context menu with VPN actions
+        root.menuOpen = !root.menuOpen
       } else {
+        root.menuOpen = false
         root.toggle()
+      }
+    }
+  }
+
+  // ---------------- right-click context menu ----------------
+  PopupCard {
+    id: ctxMenu
+    anchorItem: button
+    bar: root.bar
+    owner: root
+    open: root.menuOpen
+    triggerMode: "click"
+    contentWidth: Style.space(220)
+    contentHeight: menuCol.implicitHeight
+
+    Column {
+      id: menuCol
+      width: parent.width
+      spacing: Style.space(2)
+
+      component MenuItem: Rectangle {
+        property string label: ""
+        property string glyph: ""
+        property color tint: root.bar.foreground
+        property bool enabled: true
+        signal activated()
+        width: menuCol.width
+        implicitHeight: Style.space(30)
+        radius: Style.cornerRadius
+        color: ma.containsMouse && enabled ? Util.alpha(root.bar.foreground, 0.10) : "transparent"
+        opacity: enabled ? 1.0 : 0.4
+        Row {
+          anchors.left: parent.left
+          anchors.leftMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(10)
+          Text {
+            text: glyph
+            color: tint
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.body
+            anchors.verticalCenter: parent.verticalCenter
+          }
+          Text {
+            text: label
+            color: tint
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.body
+            anchors.verticalCenter: parent.verticalCenter
+          }
+        }
+        MouseArea {
+          id: ma
+          anchors.fill: parent
+          hoverEnabled: true
+          cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+          onClicked: { if (parent.enabled) parent.activated() }
+        }
+      }
+
+      MenuItem {
+        label: "Connect"
+        glyph: "󰌘"
+        tint: root.connectedGreen
+        enabled: !root.connected && !root.connecting && root.configured
+        onActivated: { root.menuOpen = false; root.connectVpn() }
+      }
+      MenuItem {
+        label: root.connecting ? "Cancel connecting" : "Disconnect"
+        glyph: "󰌙"
+        tint: Color.urgent
+        enabled: root.connected || root.connecting
+        onActivated: { root.menuOpen = false; root.disconnectVpn() }
+      }
+
+      PanelSeparator { foreground: root.bar.foreground }
+
+      MenuItem {
+        label: "Open panel"
+        glyph: "󰇗"
+        onActivated: { root.menuOpen = false; root.open() }
       }
     }
   }

@@ -23,14 +23,19 @@ import json
 import sys
 
 # openconnect_sso uses structlog; make sure its output never pollutes our
-# stdout (which must contain ONLY the final JSON). Configure it to stderr
-# before importing the package.
+# stdout (which must contain ONLY the final JSON). We also SILENCE the package's
+# structlog output entirely: at DEBUG/INFO it logs the full auth XML, which
+# contains the live VPN session token. Dropping it below ERROR prevents that
+# credential from ever reaching stderr or any captured log file.
 import logging
-logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+logging.basicConfig(stream=sys.stderr, level=logging.ERROR)
+logging.disable(logging.WARNING)  # drop DEBUG/INFO/WARNING records globally
 try:
     import structlog
     structlog.configure(
+        wrapper_class=structlog.make_filtering_bound_logger(logging.ERROR),
         logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+        cache_logger_on_first_use=True,
     )
 except Exception:
     pass

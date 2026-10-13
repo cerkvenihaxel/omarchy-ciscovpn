@@ -39,6 +39,7 @@ esac
 if [[ "$mode" == "uninstall" ]]; then
   step "Uninstalling"
   sudo rm -f /etc/sudoers.d/omarchy-ciscovpn && ok "removed sudoers rule" || warn "could not remove sudoers rule (needs sudo)"
+  sudo rm -rf /usr/local/lib/omarchy-ciscovpn && ok "removed root-owned helper" || warn "could not remove /usr/local/lib/omarchy-ciscovpn (needs sudo)"
   rm -f "$HOME/.local/bin/ciscovpn" && ok "removed CLI symlink"
   if command -v omarchy-bar >/dev/null; then
     omarchy-bar remove "$PLUGIN_ID" >/dev/null 2>&1 && ok "removed widget from bar" || warn "remove widget manually: omarchy bar remove $PLUGIN_ID"

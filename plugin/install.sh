@@ -67,25 +67,35 @@ else
 fi
 
 # ---------------------------------------------------------------- sudoers rule
-step "Passwordless root helper (sudoers)"
-# Only the exact helper path, nothing else. visudo-checked before install.
+step "Privileged helper (root-owned) + sudoers"
+# SECURITY: the plugin dir is user-writable, so we must NOT let sudo run the
+# helper from there (a tampered copy would be instant root). Install the helper
+# to a root-owned, root-only-writable location and whitelist THAT path.
+SECURE_DIR="/usr/local/lib/omarchy-ciscovpn"
+SECURE_HELPER="$SECURE_DIR/ciscovpn-root"
+sudo install -d -m 0755 -o root -g root "$SECURE_DIR" || fail "could not create $SECURE_DIR"
+sudo install -m 0755 -o root -g root "$ROOT_HELPER" "$SECURE_HELPER" || fail "could not install root helper"
+ok "root helper installed at $SECURE_HELPER (owned by root)"
+
+# Only the exact root-owned helper path, nothing else. visudo-checked.
 TMP_SUDO="$(mktemp)"
 cat > "$TMP_SUDO" <<EOF
 # Installed by the Cisco VPN Omarchy plugin ($PLUGIN_ID).
-# Lets $USER run ONLY the plugin's VPN root helper (openconnect up/down)
-# without a password, so the bar toggle works without a prompt.
-$USER ALL=(root) NOPASSWD: $ROOT_HELPER
+# Lets $USER run ONLY the plugin's root-owned VPN helper (openconnect up/down)
+# without a password. The helper validates all inputs and runs no caller-
+# supplied arguments. It is root-owned and not writable by $USER.
+$USER ALL=(root) NOPASSWD: $SECURE_HELPER
 EOF
 if sudo visudo -c -f "$TMP_SUDO" >/dev/null 2>&1; then
-  sudo install -m 0440 "$TMP_SUDO" "$SUDOERS_FILE" || fail "could not install sudoers rule"
-  ok "sudoers rule installed at $SUDOERS_FILE"
+  sudo install -m 0440 -o root -g root "$TMP_SUDO" "$SUDOERS_FILE" || fail "could not install sudoers rule"
+  ok "sudoers rule installed at $SUDOERS_FILE (scoped to the root-owned helper)"
 else
   rm -f "$TMP_SUDO"
   fail "sudoers rule failed validation (visudo) — not installed"
 fi
 rm -f "$TMP_SUDO"
 
-if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
+if sudo -n "$SECURE_HELPER" check >/dev/null 2>&1; then
   ok "passwordless root helper works"
 else
   warn "root helper check did not pass yet — openconnect may be missing or path changed"
@@ -108,6 +118,21 @@ else
   else
     warn "omarchy-bar not found; add manually: omarchy bar put $PLUGIN_ID"
   fi
+fi
+
+# ---------------------------------------------------------------- harden state
+step "Private state directory"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/ciscovpn"
+CONFIG_SUBDIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/ciscovpn"
+mkdir -p "$STATE_DIR" "$CONFIG_SUBDIR"
+chmod 0700 "$STATE_DIR" "$CONFIG_SUBDIR"
+# Older builds could log the SSO auth XML (which contains the live session
+# token). Remove any such logs so stale credentials don't linger on disk.
+if [[ -f "$STATE_DIR/connect.log" ]] && grep -qa 'session-token\|sso-token' "$STATE_DIR/connect.log" 2>/dev/null; then
+  shred -u "$STATE_DIR/connect.log" 2>/dev/null || rm -f "$STATE_DIR/connect.log"
+  ok "scrubbed an old log that contained SSO token material"
+else
+  ok "state dir is private (0700); no credential leak in logs"
 fi
 
 # ---------------------------------------------------------------- done

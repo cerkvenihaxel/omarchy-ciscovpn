@@ -25,7 +25,16 @@ set -uo pipefail
 PLUGIN_ID="custom.ciscovpn"
 PLUGIN_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 SELF="$PLUGIN_DIR/bin/ciscovpn"
-ROOT_HELPER="$PLUGIN_DIR/bin/ciscovpn-root"
+# The privileged helper runs from a ROOT-OWNED location (installed by
+# install.sh). The sudoers rule only whitelists that path, so a tampered copy
+# in the user-writable plugin dir can never be run as root. Fall back to the
+# local copy only when the secure one isn't installed yet (first run, no sudo).
+ROOT_HELPER_SECURE="/usr/local/lib/omarchy-ciscovpn/ciscovpn-root"
+if [[ -x "$ROOT_HELPER_SECURE" ]]; then
+  ROOT_HELPER="$ROOT_HELPER_SECURE"
+else
+  ROOT_HELPER="$PLUGIN_DIR/bin/ciscovpn-root"
+fi
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/ciscovpn"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/ciscovpn"
@@ -36,6 +45,7 @@ LOG_FILE="$STATE_DIR/connect.log"
 SERVER_RUNTIME="$STATE_DIR/server"     # host actually used for the live tunnel
 
 mkdir -p "$STATE_DIR" "$CONFIG_DIR"
+chmod 0700 "$STATE_DIR" "$CONFIG_DIR" 2>/dev/null || true
 
 # ----------------------------------------------------------------- helpers
 json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
@@ -189,7 +199,7 @@ cmd__run_connect_headless() {
   IFS=$'\t' read -r server cookie fingerprint <<<"$parsed"
 
   printf '%s' "$cookie" | sudo -n "$ROOT_HELPER" connect \
-      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint" "$CFG_EXTRA" "$LOG_FILE"
+      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint"
   local rc=$?
 
   if [[ $rc -eq 0 ]] && tun_up; then
@@ -226,7 +236,7 @@ cmd__run_connect() {
   echo "Tip: run $PLUGIN_DIR/install.sh once to make this fully silent."
   echo
   printf '%s' "$cookie" | sudo "$ROOT_HELPER" connect \
-      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint" "$CFG_EXTRA" "$LOG_FILE"
+      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint"
   local rc=$?
 
   if [[ $rc -eq 0 ]] && tun_up; then
@@ -262,13 +272,28 @@ cmd__browser() {
 }
 
 cmd_disconnect() {
+  read_config
   if ! tun_up && [[ "$(get_state)" == "disconnected" ]]; then
     echo '{"ok":true,"already":true}'; return 0
   fi
-  sudo -n "$ROOT_HELPER" disconnect "$PID_FILE" >/dev/null 2>&1
+  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
+    sudo -n "$ROOT_HELPER" disconnect "$PID_FILE" "$CFG_SERVER" >/dev/null 2>&1
+  else
+    # No passwordless rule — need a terminal for the sudo password to tear down.
+    omarchy-launch-tui --app-id=org.omarchy.ciscovpn-disconnect \
+      bash -lc "sudo '$ROOT_HELPER' disconnect '$PID_FILE' '$CFG_SERVER'; echo; echo Disconnected.; sleep 1" \
+      >/dev/null 2>&1 &
+    # give the terminal a moment; status polling will reflect the result
+  fi
   rm -f "$PID_FILE" "$SERVER_RUNTIME"
-  set_state "disconnected"
-  echo '{"ok":true}'
+  # Verify: only report disconnected if the tunnel is actually gone.
+  sleep 1
+  if tun_up; then
+    echo '{"ok":false,"error":"still connected — authorize the disconnect"}'
+  else
+    set_state "disconnected"
+    echo '{"ok":true}'
+  fi
 }
 
 cmd_doctor() {

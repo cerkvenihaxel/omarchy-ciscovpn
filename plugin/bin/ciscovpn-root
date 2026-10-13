@@ -1,72 +1,92 @@
 #!/usr/bin/env bash
-# ciscovpn-root — the only part that runs as root (via a dedicated sudoers rule).
+# ciscovpn-root — the ONLY component that runs as root (via a dedicated sudoers
+# rule). It brings a Cisco AnyConnect tunnel up from an already-obtained SAML
+# session cookie, and tears it down.
 #
-# It launches `openconnect` to build the Cisco Secure Client (AnyConnect) tunnel
-# from an already-obtained SAML session cookie, and tears it down on request.
-# Kept deliberately small and with a fixed argument shape so the sudoers rule
-# that whitelists it is tight.
+# SECURITY MODEL
+#   * This file is installed to a ROOT-OWNED, root-only-writable location
+#     (/usr/local/lib/omarchy-ciscovpn/ciscovpn-root) and the sudoers rule
+#     whitelists THAT path. The copy inside the user's plugin dir is never what
+#     sudo runs, so a user who tampers with the plugin dir cannot gain root.
+#   * Every argument from the (unprivileged) caller is strictly validated here.
+#   * No caller-supplied free-form arguments are passed to openconnect.
+#   * The SAML session cookie is read from stdin only (never argv), and is never
+#     written to any file or log by this script.
+#   * A server certificate pin is REQUIRED; we refuse to connect without one.
 #
-#   ciscovpn-root connect <server> <protocol> <pidfile> <fingerprint> [extra]
-#       -> reads the SAML session cookie from STDIN (never on the command line)
+#   ciscovpn-root connect <server> <protocol> <pidfile> <fingerprint>
+#       -> reads the SAML session cookie from STDIN
 #   ciscovpn-root disconnect <pidfile>
 #   ciscovpn-root check
-#
-# The SAML single-sign-on (CyberArk webview) happens BEFORE this, as the normal
-# user, in bin/ciscovpn-saml. This part only consumes the resulting cookie.
 
-set -uo pipefail
+set -euo pipefail
+umask 077
+
+AC_VERSION="4.10.07073"
+
+# Only these fixed state directories are acceptable for pid files / logs, so a
+# caller cannot direct root writes to arbitrary paths. We derive the invoking
+# user's home from SUDO_USER (set by sudo), falling back to nothing.
+caller="${SUDO_USER:-}"
+caller_home=""
+if [[ -n "$caller" ]]; then
+  caller_home="$(getent passwd "$caller" | cut -d: -f6)"
+fi
+
+die() { echo "ciscovpn-root: $*" >&2; exit 10; }
+
+valid_server() {   [[ "$1" =~ ^[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)?$ ]]; }
+valid_protocol() { case "$1" in anyconnect|nc|pulse|gp|f5|fortinet|array) return 0;; *) return 1;; esac; }
+valid_fp() {       [[ "$1" =~ ^((sha1|sha256|pin-sha256):)?[A-Fa-f0-9:+/=]+$ ]]; }
+valid_statepath() {
+  # pidfile/logfile must live under the caller's own omarchy ciscovpn state dir.
+  local p="$1"
+  [[ -n "$caller_home" ]] || return 1
+  local base="$caller_home/.local/state/omarchy/ciscovpn"
+  case "$p" in
+    "$base"/*) [[ "$p" != *".."* ]] ;;
+    *) return 1 ;;
+  esac
+}
 
 cmd="${1:-}"
 
 case "$cmd" in
   check)
-    # Used by `doctor` to confirm the passwordless rule works.
     command -v openconnect >/dev/null || exit 3
     exit 0
     ;;
 
   connect)
-    server="${2:?server required}"
-    protocol="${3:-anyconnect}"
-    pidfile="${4:?pidfile required}"
-    fingerprint="${5:-}"
-    extra="${6:-}"
-    logfile="${7:-}"
+    server="${2:-}"; protocol="${3:-anyconnect}"; pidfile="${4:-}"; fingerprint="${5:-}"
 
-    command -v openconnect >/dev/null || { echo "openconnect not installed"; exit 3; }
+    command -v openconnect >/dev/null || die "openconnect not installed"
+    valid_server   "$server"      || die "invalid server"
+    valid_protocol "$protocol"    || die "invalid protocol"
+    valid_statepath "$pidfile"    || die "invalid pidfile path"
+    [[ -n "$fingerprint" ]]       || die "refusing to connect without a server certificate pin"
+    valid_fp "$fingerprint"       || die "invalid fingerprint"
+
     mkdir -p "$(dirname "$pidfile")"
 
-    # The session cookie is passed on stdin so it never appears in `ps`/argv.
+    # Cookie strictly from stdin; never placed in argv or any file.
     saml_cookie="$(cat)"
-    [[ -n "$saml_cookie" ]] || { echo "no SAML cookie on stdin"; exit 4; }
+    [[ -n "$saml_cookie" ]] || die "no SAML cookie on stdin"
 
-    AC_VERSION="4.10.07073"
-    servercert_arg=()
-    # openconnect accepts the Cisco server-cert-hash verbatim (as openconnect-sso
-    # passes it); it also understands sha1:/pin-sha256: prefixes.
-    [[ -n "$fingerprint" ]] && servercert_arg=(--servercert "$fingerprint")
-
-    # --cookie-on-stdin  use the SAML session cookie we just obtained
-    # --servercert    pin the gateway cert the SSO handshake already saw
-    # NOTE: do NOT use --background here. openconnect would fork before fully
-    # consuming the piped cookie, which the gateway then rejects (401 / "Cookie
-    # was rejected"). We stay in the foreground; the user-side `setsid` detaches
-    # the whole helper so operation is still headless.
-    # Output goes to the caller's log file so the UI can show progress/errors.
-    : "${logfile:=/dev/null}"
-    # shellcheck disable=SC2086
+    # No caller free-form args. Fixed, audited argument set only.
+    # setsid detaches openconnect so it survives this helper exiting (headless),
+    # while NOT using --background (which races with --cookie-on-stdin).
     setsid openconnect \
       --protocol="$protocol" \
       --useragent="AnyConnect Linux_64 $AC_VERSION" \
       --version-string="$AC_VERSION" \
       --cookie-on-stdin \
-      "${servercert_arg[@]}" \
+      --servercert "$fingerprint" \
       --pid-file="$pidfile" \
-      $extra \
-      "$server" <<<"$saml_cookie" >>"$logfile" 2>&1 &
+      "$server" <<<"$saml_cookie" >/dev/null 2>&1 &
     oc_pid=$!
-    # Give openconnect a moment to read the cookie and bring the tunnel up,
-    # then report success based on the interface, and leave it running.
+
+    # Wait for a tun to appear (success) or the process to die (failure).
     for _ in $(seq 1 40); do
       sleep 0.5
       ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+' && break
@@ -76,22 +96,42 @@ case "$cmd" in
       [[ -f "$pidfile" ]] && chmod 0644 "$pidfile" 2>/dev/null || true
       exit 0
     fi
-    wait "$oc_pid" 2>/dev/null
-    exit ${?:-1}
+    exit 1
     ;;
 
   disconnect)
-    pidfile="${2:?pidfile required}"
+    pidfile="${2:-}"
+    server="${3:-}"
+    valid_statepath "$pidfile" || die "invalid pidfile path"
+    [[ -n "$server" ]] && { valid_server "$server" || die "invalid server"; }
+
+    killed=0
     if [[ -f "$pidfile" ]]; then
-      pid="$(cat "$pidfile" 2>/dev/null)"
-      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null
-        for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 0.4; done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+      pid="$(cat "$pidfile" 2>/dev/null || true)"
+      if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        if grep -qa openconnect "/proc/$pid/comm" 2>/dev/null \
+           || [[ "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" == *openconnect* ]]; then
+          kill "$pid" 2>/dev/null || true
+          for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 0.4; done
+          kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+          killed=1
+        fi
       fi
       rm -f "$pidfile"
     fi
-    pkill -f "openconnect .*--pid-file=$pidfile" 2>/dev/null || true
+
+    # If the pid file was lost but a tunnel is still up, find the openconnect we
+    # own for THIS server and stop it. We match argv exactly (comm=openconnect
+    # AND the server appears in its cmdline), so we never touch unrelated procs.
+    if [[ "$killed" -eq 0 && -n "$server" ]]; then
+      for pid in $(pgrep -x openconnect 2>/dev/null || true); do
+        if tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF " $server"; then
+          kill "$pid" 2>/dev/null || true
+          for _ in 1 2 3 4 5; do kill -0 "$pid" 2>/dev/null || break; sleep 0.4; done
+          kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        fi
+      done
+    fi
     exit 0
     ;;
 
