@@ -2,17 +2,17 @@
 # ciscovpn-root — the only part that runs as root (via a dedicated sudoers rule).
 #
 # It launches `openconnect` to build the Cisco Secure Client (AnyConnect) tunnel
-# using SAML/SSO through the system browser, and tears it down on request.
+# from an already-obtained SAML session cookie, and tears it down on request.
 # Kept deliberately small and with a fixed argument shape so the sudoers rule
 # that whitelists it is tight.
 #
-#   ciscovpn-root connect <server> <protocol> <browser-handler> <pidfile> <user> [extra]
+#   ciscovpn-root connect <server> <protocol> <pidfile> <fingerprint> [extra]
+#       -> reads the SAML session cookie from STDIN (never on the command line)
 #   ciscovpn-root disconnect <pidfile>
 #   ciscovpn-root check
 #
-# <browser-handler> is the user-side `ciscovpn` script; openconnect calls it as
-#   <browser-handler> _browser <URL>
-# and it opens the URL as <user> for the SAML login.
+# The SAML single-sign-on (CyberArk webview) happens BEFORE this, as the normal
+# user, in bin/ciscovpn-saml. This part only consumes the resulting cookie.
 
 set -uo pipefail
 
@@ -28,48 +28,56 @@ case "$cmd" in
   connect)
     server="${2:?server required}"
     protocol="${3:-anyconnect}"
-    browser_handler="${4:?browser handler required}"
-    pidfile="${5:?pidfile required}"
-    user="${6:?user required}"
-    extra="${7:-}"
+    pidfile="${4:?pidfile required}"
+    fingerprint="${5:-}"
+    extra="${6:-}"
+    logfile="${7:-}"
 
     command -v openconnect >/dev/null || { echo "openconnect not installed"; exit 3; }
-
     mkdir -p "$(dirname "$pidfile")"
 
-    # Export the target user so the browser handler can drop privileges.
-    export CISCOVPN_USER="$user"
+    # The session cookie is passed on stdin so it never appears in `ps`/argv.
+    saml_cookie="$(cat)"
+    [[ -n "$saml_cookie" ]] || { echo "no SAML cookie on stdin"; exit 4; }
 
-    # Build the external-browser command. openconnect appends the SSO URL as a
-    # final argument, so the handler receives:  <handler> _browser <URL>
-    #
-    # openconnect's --external-browser takes ONE executable path. We point it at
-    # a tiny generated shim (written per-connection) that forwards to our
-    # handler with the _browser subcommand.
-    shim="$(mktemp /tmp/ciscovpn-browser.XXXXXX)"
-    cat > "$shim" <<EOF
-#!/usr/bin/env bash
-exec "$browser_handler" _browser "\$@"
-EOF
-    chmod 755 "$shim"
-    # make sure the user can be reached by the handler's sudo -u
-    export SUDO_USER="$user"
+    AC_VERSION="4.10.07073"
+    servercert_arg=()
+    # openconnect accepts the Cisco server-cert-hash verbatim (as openconnect-sso
+    # passes it); it also understands sha1:/pin-sha256: prefixes.
+    [[ -n "$fingerprint" ]] && servercert_arg=(--servercert "$fingerprint")
 
-    cleanup() { rm -f "$shim"; }
-    trap cleanup EXIT
-
-    echo "Launching openconnect to $server ..."
-    # --protocol         speak the Cisco Secure Client / AnyConnect protocol
-    # --external-browser  do SAML SSO via the system browser (CyberArk IdP)
-    # --pid-file          lets the user side detect a live tunnel
-    # Foreground (no --background) so closing the terminal/openconnect ends it.
+    # --cookie-on-stdin  use the SAML session cookie we just obtained
+    # --servercert    pin the gateway cert the SSO handshake already saw
+    # NOTE: do NOT use --background here. openconnect would fork before fully
+    # consuming the piped cookie, which the gateway then rejects (401 / "Cookie
+    # was rejected"). We stay in the foreground; the user-side `setsid` detaches
+    # the whole helper so operation is still headless.
+    # Output goes to the caller's log file so the UI can show progress/errors.
+    : "${logfile:=/dev/null}"
     # shellcheck disable=SC2086
-    exec openconnect \
+    setsid openconnect \
       --protocol="$protocol" \
-      --external-browser="$shim" \
+      --useragent="AnyConnect Linux_64 $AC_VERSION" \
+      --version-string="$AC_VERSION" \
+      --cookie-on-stdin \
+      "${servercert_arg[@]}" \
       --pid-file="$pidfile" \
       $extra \
-      "$server"
+      "$server" <<<"$saml_cookie" >>"$logfile" 2>&1 &
+    oc_pid=$!
+    # Give openconnect a moment to read the cookie and bring the tunnel up,
+    # then report success based on the interface, and leave it running.
+    for _ in $(seq 1 40); do
+      sleep 0.5
+      ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+' && break
+      kill -0 "$oc_pid" 2>/dev/null || break
+    done
+    if ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+'; then
+      [[ -f "$pidfile" ]] && chmod 0644 "$pidfile" 2>/dev/null || true
+      exit 0
+    fi
+    wait "$oc_pid" 2>/dev/null
+    exit ${?:-1}
     ;;
 
   disconnect)
@@ -83,7 +91,6 @@ EOF
       fi
       rm -f "$pidfile"
     fi
-    # Also sweep any stray openconnect we own, as a safety net.
     pkill -f "openconnect .*--pid-file=$pidfile" 2>/dev/null || true
     exit 0
     ;;

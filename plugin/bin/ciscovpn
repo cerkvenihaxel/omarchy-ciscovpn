@@ -41,7 +41,7 @@ mkdir -p "$STATE_DIR" "$CONFIG_DIR"
 json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
 read_config() {
-  CFG_SERVER=""; CFG_PROTOCOL="anyconnect"; CFG_BROWSER=""; CFG_EXTRA=""
+  CFG_SERVER=""; CFG_PROTOCOL="anyconnect"; CFG_BROWSER=""; CFG_EXTRA=""; CFG_AUTHGROUP=""
   [[ -f "$CONFIG_FILE" ]] || return 0
   eval "$(python3 - "$CONFIG_FILE" <<'PY'
 import json,sys,shlex
@@ -54,6 +54,7 @@ emit("CFG_SERVER", d.get("server",""))
 emit("CFG_PROTOCOL", d.get("protocol","anyconnect"))
 emit("CFG_BROWSER", d.get("browser",""))
 emit("CFG_EXTRA", d.get("extraArgs",""))
+emit("CFG_AUTHGROUP", d.get("authgroup",""))
 PY
 )"
 }
@@ -74,13 +75,22 @@ get_state() { [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE" || echo disconnected; 
 set_state() { echo "$1" > "$STATE_FILE"; }
 
 tun_up() {
-  # A live openconnect holds the pid file and keeps a tun/vpn interface up.
+  # Connected if our pid file points at a live process …
   local pid
-  [[ -f "$PID_FILE" ]] || return 1
-  pid="$(cat "$PID_FILE" 2>/dev/null)"
-  [[ -n "$pid" ]] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
-  return 0
+  if [[ -f "$PID_FILE" ]]; then
+    pid="$(cat "$PID_FILE" 2>/dev/null)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  # … or an openconnect we own is running for this gateway with a tun up.
+  # (covers a tunnel whose pid file was lost, e.g. after a crash/manual kill)
+  if pgrep -f "openconnect .*${CFG_SERVER:-__nope__}" >/dev/null 2>&1; then
+    if ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+'; then
+      return 0
+    fi
+  fi
+  return 1
 }
 
 # ----------------------------------------------------------------- commands
@@ -136,73 +146,100 @@ cmd_connect() {
     echo '{"ok":false,"error":"no server configured"}'; return 1
   fi
   if tun_up; then echo '{"ok":true,"already":true}'; return 0; fi
-  set_state "connecting"
   : > "$LOG_FILE"
-  # Run the actual connect inside a styled terminal so the user sees the SSO
-  # progress and the browser can pop up. The terminal stays until disconnect.
-  omarchy-launch-tui --app-id=org.omarchy.ciscovpn-connect \
-    bash -lc "'$SELF' _run-connect" >/dev/null 2>&1 &
-  echo '{"ok":true,"launched":true}'
+
+  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
+    # Passwordless rule present → fully headless: SSO webview (GUI) + background
+    # openconnect. No terminal window at all. Run detached so the bar returns.
+    set_state "connecting"
+    setsid bash -lc "'$SELF' _run-connect-headless" >>"$LOG_FILE" 2>&1 &
+    echo '{"ok":true,"headless":true}'
+  else
+    # No passwordless rule yet → we need a terminal once for the sudo password.
+    set_state "connecting"
+    omarchy-launch-tui --app-id=org.omarchy.ciscovpn-connect \
+      bash -lc "'$SELF' _run-connect" >/dev/null 2>&1 &
+    echo '{"ok":true,"launched":true,"needsSudoRule":true}'
+  fi
+}
+
+# Shared: run the SAML webview as the user and echo "server|cookie|fingerprint".
+_saml_authenticate() {
+  local saml_helper="$PLUGIN_DIR/bin/ciscovpn-saml"
+  local saml_json
+  saml_json="$("$saml_helper" "$CFG_SERVER" "$CFG_AUTHGROUP" 2>>"$LOG_FILE")"
+  local rc=$?
+  [[ $rc -ne 0 || -z "$saml_json" ]] && return 1
+  python3 - "$saml_json" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1])
+print("%s\t%s\t%s" % (d.get("server",""), d.get("cookie",""), d.get("fingerprint","")))
+PY
+}
+
+# Headless connect: no terminal. SSO webview pops up (GUI), tunnel runs in the
+# background. Used when the passwordless sudoers rule is installed.
+cmd__run_connect_headless() {
+  read_config
+  echo "$CFG_SERVER" > "$SERVER_RUNTIME"
+  set_state "connecting"
+
+  local parsed server cookie fingerprint
+  parsed="$(_saml_authenticate)" || { set_state "error"; rm -f "$SERVER_RUNTIME"; set_state "disconnected"; return 1; }
+  IFS=$'\t' read -r server cookie fingerprint <<<"$parsed"
+
+  printf '%s' "$cookie" | sudo -n "$ROOT_HELPER" connect \
+      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint" "$CFG_EXTRA" "$LOG_FILE"
+  local rc=$?
+
+  if [[ $rc -eq 0 ]] && tun_up; then
+    set_state "connected"
+  else
+    set_state "error"
+    rm -f "$PID_FILE" "$SERVER_RUNTIME"
+    set_state "disconnected"
+  fi
 }
 
 cmd__run_connect() {
   read_config
-  local browser="${CFG_BROWSER:-$SELF _browser}"
-  # openconnect's --external-browser takes a single executable; wrap ours.
-  local browser_cmd="$SELF"
   echo "$CFG_SERVER" > "$SERVER_RUNTIME"
 
-  echo "== Cisco VPN (openconnect) =="
+  echo "== Cisco VPN (openconnect + SAML/CyberArk) =="
   echo "Gateway : $CFG_SERVER"
-  echo "Protocol: ${CFG_PROTOCOL:-anyconnect}"
-  echo "Auth    : SAML / SSO via system browser (CyberArk)"
+  echo
+  echo "This one-time prompt disappears after you enable passwordless connect."
   echo
 
   set_state "connecting"
 
-  # openconnect needs root to create the tunnel device. Prefer the passwordless
-  # rule (installed by install.sh); if it isn't there yet, fall back to an
-  # interactive sudo prompt in THIS terminal so the flow still works. Either way
-  # the SSO browser opens once openconnect contacts the gateway.
-  local -a helper_cmd=(
-    "$ROOT_HELPER" connect
-    "$CFG_SERVER"
-    "${CFG_PROTOCOL:-anyconnect}"
-    "$SELF"
-    "$PID_FILE"
-    "$USER"
-    "$CFG_EXTRA"
-  )
+  echo "Opening the SSO login window — complete your CyberArk sign-in there…"
+  local parsed server cookie fingerprint
+  parsed="$(_saml_authenticate)" || {
+    set_state "error"; echo "SSO login failed (see $LOG_FILE)."
+    rm -f "$SERVER_RUNTIME"; set_state "disconnected"
+    echo; read -rp "Press Enter to close."; return 1
+  }
+  IFS=$'\t' read -r server cookie fingerprint <<<"$parsed"
 
-  if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
-    echo "A browser window will open for single sign-on. Complete it there."
-    echo "Keep this window open while connected; close it or run disconnect to stop."
-    echo
-    sudo -n "${helper_cmd[@]}"
-  else
-    echo "The VPN needs root to create the tunnel (openconnect)."
-    echo "Tip: run the installer once to skip this prompt in the future:"
-    echo "     bash \"$PLUGIN_DIR/install.sh\""
-    echo
-    echo "Enter your sudo password below. A browser window will then open for SSO."
-    echo "Keep this window open while connected; close it or run disconnect to stop."
-    echo
-    sudo "${helper_cmd[@]}"
-  fi
+  echo "SSO complete. Bringing up the tunnel (enter your sudo password)…"
+  echo "Tip: run $PLUGIN_DIR/install.sh once to make this fully silent."
+  echo
+  printf '%s' "$cookie" | sudo "$ROOT_HELPER" connect \
+      "$server" "${CFG_PROTOCOL:-anyconnect}" "$PID_FILE" "$fingerprint" "$CFG_EXTRA" "$LOG_FILE"
   local rc=$?
 
-  if [[ $rc -eq 0 ]]; then
+  if [[ $rc -eq 0 ]] && tun_up; then
     set_state "connected"
+    echo
+    echo "Connected. You can close this window; the VPN stays up in the background."
+    read -rp "Press Enter to close."
   else
     set_state "error"
-    echo
-    echo "openconnect exited with code $rc. See above for details."
+    rm -f "$PID_FILE" "$SERVER_RUNTIME"; set_state "disconnected"
+    echo; echo "Connection failed (exit $rc). See $LOG_FILE."
+    read -rp "Press Enter to close."
   fi
-  # When openconnect foregrounds, closing it returns here -> disconnected.
-  rm -f "$PID_FILE" "$SERVER_RUNTIME"
-  set_state "disconnected"
-  echo
-  read -rp "Disconnected. Press Enter to close."
 }
 
 cmd__browser() {
@@ -242,6 +279,11 @@ cmd_doctor() {
   openconnect --version 2>/dev/null | head -1
   echo "server      : ${CFG_SERVER:-<not set>}"
   echo "protocol    : ${CFG_PROTOCOL:-anyconnect}"
+  if python3 -c "import openconnect_sso, PyQt6.QtWebEngineWidgets" >/dev/null 2>&1; then
+    echo "saml webview: OK (openconnect_sso + PyQt6 WebEngine)"
+  else
+    echo "saml webview: MISSING — run: yay -S openconnect-sso"
+  fi
   echo "state       : $(get_state)"
   echo "root helper : $ROOT_HELPER"
   if sudo -n "$ROOT_HELPER" check >/dev/null 2>&1; then
@@ -257,13 +299,15 @@ cmd_doctor() {
 }
 
 case "${1:-status}" in
-  status)        cmd_status ;;
-  config)        cmd_config ;;
-  set-server)    shift; cmd_set_server "${1:-}" ;;
-  connect)       cmd_connect ;;
-  disconnect)    cmd_disconnect ;;
-  doctor)        cmd_doctor ;;
-  _run-connect)  cmd__run_connect ;;
-  _browser)      shift; cmd__browser "${1:-}" ;;
+  status)                 cmd_status ;;
+  config)                 cmd_config ;;
+  set-server)             shift; cmd_set_server "${1:-}" ;;
+  connect)                cmd_connect ;;
+  disconnect)             cmd_disconnect ;;
+  doctor)                 cmd_doctor ;;
+  sudo-rule-ok)           sudo -n "$ROOT_HELPER" check >/dev/null 2>&1 && echo '{"ok":true}' || echo '{"ok":false}' ;;
+  _run-connect)           cmd__run_connect ;;
+  _run-connect-headless)  cmd__run_connect_headless ;;
+  _browser)               shift; cmd__browser "${1:-}" ;;
   *) echo "{\"error\":\"unknown command: $1\"}"; exit 2 ;;
 esac

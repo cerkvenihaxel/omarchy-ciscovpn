@@ -28,6 +28,7 @@ Panel {
   property string iface: ""
   property string ip: ""
   property bool configured: false
+  property bool sudoRuleOk: true
   property string message: ""
   property bool messageIsError: false
 
@@ -50,7 +51,11 @@ Panel {
     : vpnState === "error" ? glyphError
     : glyphDisconnected
 
-  readonly property color stateColor: connected ? Color.accent
+  // Explicit green for the connected state (icon + "Connected" legend), rather
+  // than the theme accent which may not be green.
+  readonly property color connectedGreen: "#3fb950"
+
+  readonly property color stateColor: connected ? connectedGreen
     : connecting ? Color.foreground
     : vpnState === "error" ? Color.urgent
     : root.bar ? root.bar.foreground : Color.foreground
@@ -96,6 +101,25 @@ Panel {
   function runDoctor() {
     Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.ciscovpn-doctor",
       "bash", "-lc", root.cli + " doctor | less -R"])
+  }
+  function runInstaller() {
+    Quickshell.execDetached(["omarchy-launch-tui", "--app-id=org.omarchy.ciscovpn-install",
+      "bash", "-lc", "bash '" + Quickshell.env("HOME")
+        + "/.config/omarchy/plugins/custom.ciscovpn/install.sh'; echo; read -rp 'Press Enter to close'"])
+  }
+  function checkSudoRule() {
+    if (!sudoRuleProc.running) sudoRuleProc.running = true
+  }
+
+  Process {
+    id: sudoRuleProc
+    command: [root.cli, "sudo-rule-ok"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.sudoRuleOk = !!JSON.parse(text).ok } catch (e) { root.sudoRuleOk = false }
+      }
+    }
   }
 
   Process {
@@ -184,10 +208,10 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  Component.onCompleted: { root.loadConfig(); root.refresh() }
+  Component.onCompleted: { root.loadConfig(); root.refresh(); root.checkSudoRule() }
 
   onOpenedChanged: {
-    if (opened) { root.message = ""; root.loadConfig(); root.refresh() }
+    if (opened) { root.message = ""; root.loadConfig(); root.refresh(); root.checkSudoRule() }
   }
 
   IpcHandler {
@@ -250,10 +274,22 @@ Panel {
       anchors.fill: parent
       onCloseRequested: root.close()
 
-      Column {
-        id: panelColumn
-        width: parent.width
-        spacing: Style.space(14)
+      ScrollView {
+        id: scrollArea
+        anchors.fill: parent
+        clip: true
+        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+        ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        Binding {
+          target: scrollArea.contentItem
+          property: "interactive"
+          value: panelColumn.implicitHeight > scrollArea.height
+        }
+
+        Column {
+          id: panelColumn
+          width: scrollArea.availableWidth
+          spacing: Style.space(14)
 
         // ---------- Hero ----------
         PanelHero {
@@ -262,13 +298,67 @@ Panel {
           fontFamily: root.bar.fontFamily
           title: "Cisco VPN"
           meta: root.configured ? (root.server + (root.ip ? "  ·  " + root.ip : "")) : "no gateway configured"
-          detail: root.stateLabel
           iconComponent: Component {
             Text {
               text: root.barGlyph
               color: root.stateColor
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.display
+            }
+          }
+        }
+
+        // Connection status legend — green when connected, matching the icon.
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+          Text {
+            text: root.barGlyph
+            color: root.stateColor
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.body
+          }
+          Text {
+            text: root.stateLabel
+            color: root.stateColor
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+        }
+
+        // Passwordless/no-window hint — only when the sudoers rule is missing.
+        Rectangle {
+          visible: !root.sudoRuleOk
+          width: parent.width
+          implicitHeight: pwlCol.implicitHeight + Style.space(20)
+          radius: Style.cornerRadius
+          color: Util.alpha(Color.urgent, 0.10)
+          border.color: Util.alpha(Color.urgent, 0.45)
+          border.width: 1
+
+          Column {
+            id: pwlCol
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.margins: Style.space(12)
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              text: "Connect opens a terminal for your sudo password. Enable passwordless connect once to make it fully silent (no window, no prompt)."
+              color: Color.urgent
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.Wrap
+            }
+            Button {
+              text: "Enable passwordless connect"
+              bordered: true
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              onClicked: root.runInstaller()
             }
           }
         }
@@ -397,17 +487,6 @@ Panel {
           font.pixelSize: Style.font.caption
           wrapMode: Text.Wrap
         }
-
-        PanelSeparator { foreground: root.bar.foreground }
-
-        // ---------- Diagnostics ----------
-        Button {
-          width: parent.width
-          text: "Diagnostics (doctor)"
-          iconText: "󰒓"
-          foreground: root.bar.foreground
-          fontFamily: root.bar.fontFamily
-          onClicked: root.runDoctor()
         }
       }
     }

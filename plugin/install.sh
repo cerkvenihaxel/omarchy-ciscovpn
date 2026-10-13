@@ -42,7 +42,29 @@ else
   fi
   ok "openconnect installed"
 fi
-command -v xdg-open >/dev/null && ok "xdg-open present (SSO browser launcher)" || warn "xdg-open missing — SAML browser launch may fail"
+command -v xdg-open >/dev/null && ok "xdg-open present" || warn "xdg-open missing"
+
+# ---------------------------------------------------------------- SAML webview deps
+step "SAML SSO webview (single-sign-on-v2)"
+# This gateway family uses Cisco's single-sign-on-v2 (embedded SAMLv2) flow,
+# which native openconnect --external-browser cannot drive. bin/ciscovpn-saml
+# does the login in a Qt WebEngine window and reuses the proven protocol code
+# from the openconnect_sso package. We need that package importable + PyQt6
+# WebEngine.
+if python3 -c "import openconnect_sso, PyQt6.QtWebEngineWidgets" >/dev/null 2>&1; then
+  ok "openconnect_sso + PyQt6 WebEngine present"
+else
+  warn "SAML webview deps missing."
+  echo "    Install from the AUR (uses system PyQt6, works on current Python):"
+  echo "      yay -S openconnect-sso"
+  echo "    (pulls python-pyqt6-webengine and the openconnect_sso module this plugin reuses)"
+  if command -v yay >/dev/null; then
+    read -rp "    Install openconnect-sso with yay now? [y/N] " ans
+    if [[ "${ans,,}" == y* ]]; then
+      yay -S --needed openconnect-sso && ok "openconnect-sso installed" || warn "yay install failed — install manually"
+    fi
+  fi
+fi
 
 # ---------------------------------------------------------------- sudoers rule
 step "Passwordless root helper (sudoers)"

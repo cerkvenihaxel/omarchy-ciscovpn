@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""ciscovpn-saml — Cisco AnyConnect SAMLv2 (single-sign-on-v2) login helper.
+
+Runs as the normal user (never root). It drives the AnyConnect auth XML
+handshake with the gateway, opens the IdP (CyberArk) login page in a Qt
+WebEngine window, captures the SAML token cookie, finishes the auth exchange,
+and prints the connection parameters as JSON for the caller to hand to
+openconnect:
+
+    {"server": "...", "cookie": "<session-token>",
+     "fingerprint": "<server-cert-hash>", "usergroup": "..."}
+
+Why this exists: `openconnect --external-browser` only handles the
+`single-sign-on-external-browser` method, but this gateway selects
+`single-sign-on-v2` (an embedded SAMLv2 webview flow). This reuses the proven
+Cisco protocol code from the installed `openconnect_sso` package (requests
+session, XML request builders, response parsers) but replaces that project's
+broken asyncio/Qt entry point (it crashes on Python 3.12+) with a small,
+synchronous PyQt6 WebEngine window.
+"""
+
+import json
+import sys
+
+# openconnect_sso uses structlog; make sure its output never pollutes our
+# stdout (which must contain ONLY the final JSON). Configure it to stderr
+# before importing the package.
+import logging
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING)
+try:
+    import structlog
+    structlog.configure(
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+    )
+except Exception:
+    pass
+
+# Reuse openconnect-sso's battle-tested Cisco AnyConnect protocol pieces.
+try:
+    from openconnect_sso import authenticator as A
+    from openconnect_sso.config import HostProfile
+except Exception as exc:  # pragma: no cover
+    print(f"openconnect_sso package not importable: {exc}", file=sys.stderr)
+    sys.exit(3)
+
+AC_VERSION = "4.10.07073"
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def run_webview(login_url, token_cookie_name):
+    """Open the IdP login in a Qt WebEngine window; return the token cookie value."""
+    from PyQt6.QtCore import QUrl, QTimer
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+
+    app = QApplication(sys.argv[:1])
+    captured = {"token": None}
+
+    profile = QWebEngineProfile("ciscovpn", app)
+    profile.setHttpUserAgent(f"AnyConnect Linux_64 {AC_VERSION}")
+    store = profile.cookieStore()
+
+    def on_cookie(cookie):
+        name = bytes(cookie.name()).decode("ascii", "replace")
+        val = bytes(cookie.value()).decode("ascii", "replace")
+        if name == token_cookie_name and val:
+            captured["token"] = val
+            QTimer.singleShot(150, app.quit)
+
+    store.cookieAdded.connect(on_cookie)
+
+    page = QWebEnginePage(profile)
+    view = QWebEngineView()
+    view.setPage(page)
+    view.setWindowTitle("Cisco VPN — SSO login")
+    view.resize(540, 720)
+    view.load(QUrl(str(login_url)))
+    view.show()
+
+    QTimer.singleShot(300_000, app.quit)  # 5-min hard cap
+    app.exec()
+    return captured["token"]
+
+
+def main():
+    if len(sys.argv) < 2:
+        raise SystemExit("usage: ciscovpn-saml <server> [usergroup]")
+    server = sys.argv[1].replace("https://", "").replace("http://", "").split("/")[0]
+    usergroup = sys.argv[2] if len(sys.argv) > 2 else ""
+
+    # Build the HostProfile the authenticator expects.
+    #   address    = https://<server>
+    #   user_group = URL path group (optional)
+    #   name       = authgroup (optional)
+    host = HostProfile(address=f"https://{server}", user_group=usergroup, name=usergroup)
+
+    auth = A.Authenticator(host, version=AC_VERSION)
+    # create_http_session + the two POSTs are what we need; drive them directly
+    # instead of the async authenticate() wrapper.
+    auth.session = A.create_http_session(None, AC_VERSION)
+    auth._detect_authentication_target_url()
+
+    log(f"[saml] negotiating with {server} …")
+    auth_req = auth._start_authentication()
+    if not getattr(auth_req, "login_url", None):
+        raise SystemExit("gateway did not return an sso-v2-login URL (not a SAMLv2 gateway?)")
+
+    log(f"[saml] opening SSO login window …")
+    token = run_webview(auth_req.login_url, auth_req.token_cookie_name)
+    if not token:
+        raise SystemExit("SSO window closed before a token was issued")
+
+    log("[saml] token received, finishing authentication …")
+    done = auth._complete_authentication(auth_req, token)
+    if not done or not getattr(done, "session_token", None):
+        raise SystemExit("auth-reply did not yield a session token")
+
+    result = {
+        "server": server,
+        "cookie": str(done.session_token),
+        "fingerprint": str(getattr(done, "server_cert_hash", "") or ""),
+        "usergroup": usergroup,
+    }
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()
