@@ -270,75 +270,66 @@ Panel {
     owner: root
     open: root.menuOpen
     triggerMode: "click"
-    contentWidth: Style.space(220)
-    contentHeight: menuCol.implicitHeight
+    contentWidth: ctxMenu.fittedContentWidth(Style.space(220))
+    contentHeight: ctxMenu.fittedContentHeight(menuCol.implicitHeight)
 
     Column {
       id: menuCol
       width: parent.width
       spacing: Style.space(2)
 
-      component MenuItem: Rectangle {
-        property string label: ""
-        property string glyph: ""
-        property color tint: root.bar.foreground
-        property bool enabled: true
-        signal activated()
-        width: menuCol.width
-        implicitHeight: Style.space(30)
+      // Connect
+      Rectangle {
+        width: parent.width
+        implicitHeight: Style.space(32)
         radius: Style.cornerRadius
-        color: ma.containsMouse && enabled ? Util.alpha(root.bar.foreground, 0.10) : "transparent"
-        opacity: enabled ? 1.0 : 0.4
+        visible: !root.connected && !root.connecting
+        enabled: root.configured
+        opacity: root.configured ? 1.0 : 0.4
+        color: connectMa.containsMouse && root.configured ? Util.alpha(root.bar.foreground, 0.12) : "transparent"
         Row {
-          anchors.left: parent.left
-          anchors.leftMargin: Style.space(10)
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(10)
-          Text {
-            text: glyph
-            color: tint
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.body
-            anchors.verticalCenter: parent.verticalCenter
-          }
-          Text {
-            text: label
-            color: tint
-            font.family: root.bar.fontFamily
-            font.pixelSize: Style.font.body
-            anchors.verticalCenter: parent.verticalCenter
-          }
+          anchors.left: parent.left; anchors.leftMargin: Style.space(12)
+          anchors.verticalCenter: parent.verticalCenter; spacing: Style.space(10)
+          Text { text: "󰌘"; color: root.connectedGreen; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+          Text { text: "Connect"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
         }
-        MouseArea {
-          id: ma
-          anchors.fill: parent
-          hoverEnabled: true
-          cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
-          onClicked: { if (parent.enabled) parent.activated() }
-        }
+        MouseArea { id: connectMa; anchors.fill: parent; hoverEnabled: true; cursorShape: root.configured ? Qt.PointingHandCursor : Qt.ArrowCursor
+          onClicked: { if (root.configured) { root.menuOpen = false; root.connectVpn() } } }
       }
 
-      MenuItem {
-        label: "Connect"
-        glyph: "󰌘"
-        tint: root.connectedGreen
-        enabled: !root.connected && !root.connecting && root.configured
-        onActivated: { root.menuOpen = false; root.connectVpn() }
-      }
-      MenuItem {
-        label: root.connecting ? "Cancel connecting" : "Disconnect"
-        glyph: "󰌙"
-        tint: Color.urgent
-        enabled: root.connected || root.connecting
-        onActivated: { root.menuOpen = false; root.disconnectVpn() }
+      // Disconnect / cancel
+      Rectangle {
+        width: parent.width
+        implicitHeight: Style.space(32)
+        radius: Style.cornerRadius
+        visible: root.connected || root.connecting
+        color: discMa.containsMouse ? Util.alpha(Color.urgent, 0.12) : "transparent"
+        Row {
+          anchors.left: parent.left; anchors.leftMargin: Style.space(12)
+          anchors.verticalCenter: parent.verticalCenter; spacing: Style.space(10)
+          Text { text: "󰌙"; color: Color.urgent; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+          Text { text: root.connecting ? "Cancel connecting" : "Disconnect"; color: Color.urgent; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+        }
+        MouseArea { id: discMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+          onClicked: { root.menuOpen = false; root.disconnectVpn() } }
       }
 
       PanelSeparator { foreground: root.bar.foreground }
 
-      MenuItem {
-        label: "Open panel"
-        glyph: "󰇗"
-        onActivated: { root.menuOpen = false; root.open() }
+      // Open panel
+      Rectangle {
+        width: parent.width
+        implicitHeight: Style.space(32)
+        radius: Style.cornerRadius
+        color: openMa.containsMouse ? Util.alpha(root.bar.foreground, 0.12) : "transparent"
+        Row {
+          anchors.left: parent.left; anchors.leftMargin: Style.space(12)
+          anchors.verticalCenter: parent.verticalCenter; spacing: Style.space(10)
+          Text { text: "󰇗"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+          Text { text: "Open panel"; color: root.bar.foreground; font.family: root.bar.fontFamily; font.pixelSize: Style.font.body; anchors.verticalCenter: parent.verticalCenter }
+        }
+        MouseArea { id: openMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+          onClicked: { root.menuOpen = false; root.open() } }
       }
     }
   }
