@@ -68,14 +68,19 @@ case "$cmd" in
     valid_fp "$fingerprint"       || die "invalid fingerprint"
 
     mkdir -p "$(dirname "$pidfile")"
+    logfile="$(dirname "$pidfile")/connect.log"
 
     # Cookie strictly from stdin; never placed in argv or any file.
     saml_cookie="$(cat)"
     [[ -n "$saml_cookie" ]] || die "no SAML cookie on stdin"
 
+    rm -f "$pidfile"
     # No caller free-form args. Fixed, audited argument set only.
-    # setsid detaches openconnect so it survives this helper exiting (headless),
-    # while NOT using --background (which races with --cookie-on-stdin).
+    # Detached in its own session so it survives this helper exiting, but NOT
+    # with --background (which races with --cookie-on-stdin). openconnect writes
+    # its own PID to --pid-file; we track THAT (setsid's pid exits immediately).
+    # Its progress/errors go to the log so the UI can diagnose failures.
+    echo "--- openconnect $(date) ---" >>"$logfile"
     setsid openconnect \
       --protocol="$protocol" \
       --useragent="AnyConnect Linux_64 $AC_VERSION" \
@@ -83,19 +88,26 @@ case "$cmd" in
       --cookie-on-stdin \
       --servercert "$fingerprint" \
       --pid-file="$pidfile" \
-      "$server" <<<"$saml_cookie" >/dev/null 2>&1 &
-    oc_pid=$!
+      "$server" <<<"$saml_cookie" >>"$logfile" 2>&1 &
+    disown 2>/dev/null || true
 
-    # Wait for a tun to appear (success) or the process to die (failure).
+    # Wait for the tunnel interface to appear. Guard every command so `set -e`
+    # never aborts the loop on a non-zero grep/ip/kill.
+    up=0
     for _ in $(seq 1 40); do
       sleep 0.5
-      ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+' && break
-      kill -0 "$oc_pid" 2>/dev/null || break
+      if ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+'; then up=1; break; fi
+      if [[ -f "$pidfile" ]]; then
+        p="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ "$p" =~ ^[0-9]+$ ]] && ! kill -0 "$p" 2>/dev/null; then break; fi
+      fi
     done
-    if ip -o link show 2>/dev/null | grep -qE ': (tun|vpn|cscotun)[0-9]+'; then
+    if [[ "$up" -eq 1 ]]; then
       [[ -f "$pidfile" ]] && chmod 0644 "$pidfile" 2>/dev/null || true
+      [[ -n "$caller" ]] && chown "$caller" "$logfile" 2>/dev/null || true
       exit 0
     fi
+    [[ -n "$caller" ]] && chown "$caller" "$logfile" 2>/dev/null || true
     exit 1
     ;;
 
